@@ -90,11 +90,54 @@ console.log('\n1. 응답 정리');
   const ctx = await browser.newContext(); const p = await ctx.newPage();
   await p.goto(BASE + '?selftest'); await p.waitForFunction(() => window.tongCore);
   const t = await p.evaluate(() => { const C = window.tongCore; return {
-    st: [C.parseStamp('2026/10/30 11:59:00 오후 GMT+9'), C.parseStamp('2026. 10. 30 오후 11:59:00'), C.parseStamp('2026-10-30 23:59')],
+    st: [C.parseStamp('2026/10/30 11:59:00 오후 GMT+9'), C.parseStamp('2026. 10. 30 오후 11:59:00'), C.parseStamp('10/30/2026 23:59:00'), C.parseStamp('2026-10-30 23:59')],
     csv: [C.csvCell('=HYPERLINK("x")'), C.csvCell('-1.5'), C.csvCell('+82 10'), C.csvCell('보통')] }; });
-  ok('타임스탬프 세 가지 꼴을 같은 시각으로 읽음', t.st.every(v => v === t.st[2]) && t.st[2] != null);
+  ok('타임스탬프 네 가지 꼴(영어 폼 월/일/연도 포함)을 같은 시각으로 읽음', t.st.every(v => v === t.st[3]) && t.st[3] != null);
   ok('CSV: =로 시작하는 글은 막고 음수는 그대로', t.csv[0].startsWith(`"'=`) && t.csv[1] === '"-1.5"' && t.csv[2].startsWith(`"'+`) && t.csv[3] === '"보통"', t.csv.join(' '));
   await ctx.close();
+}
+
+// ===================== 1-2. 클리닝 보강 =====================
+console.log('\n1-2. 클리닝: 주의 확인 · 불성실 기준 · 대상 조건 · 값 정리 · 직접 빼기');
+{
+  const { p, sv, errs } = await open(`sv.attn = [{ text: "이 문항에는 '그렇다'를 골라 주세요.", si: 1, answer: 3 }];`);
+  let longId = '', revId = '';
+  const r = await loadRows(p, (rows, head) => {
+    const gc = head.indexOf(sv.demos[0].text), ac = head.indexOf(sv.demos[1].text);
+    rows[2][gc] = '남'; rows[3][gc] = '여자'; rows[4][gc] = '모름';           // 선택지에 없는 값
+    rows[5][ac] = '23세'; rows[6][ac] = '스물셋';                           // 숫자 정리
+    // 같은 번호 연속: 첫 15문항을 '보통이다'로 (나머지는 그대로)
+    const it = sv.scales.flatMap((s0, si) => s0.items.map(x => ({ c: head.indexOf(x.text), lab: s0.labels }))).filter(x => x.c >= 0);
+    it.slice(0, 15).forEach(x => { rows[10][x.c] = x.lab[2]; }); longId = 'R011';
+    // 역문항 모순: 첫 척도의 모든 문항(정·역)에 '매우 그렇다'
+    sv.scales[0].items.forEach(x => { rows[12][head.indexOf(x.text)] = sv.scales[0].labels[sv.scales[0].labels.length - 1]; }); revId = 'R013';
+    return rows;
+  });
+  ok('주의 확인 문항: 틀린 응답은 기본으로 뺌', /주의 확인 [1-9]/.test(r.stats), r.stats.match(/제외[^)]*\)/)?.[0]);
+  const box = await p.$eval('.dq-clean', e => e.innerText);
+  ok('같은 번호 연속 응답을 찾음', box.includes(longId), (box.match(/같은 번호 연속[^\n]*\n[^\n]*/) || [''])[0].replace(/\n/g, ' '));
+  ok('정문항·역문항 모순 응답을 찾음', box.includes(revId));
+  ok('선택지에 없는 성별 값: 같은 뜻은 자동으로 바꾸고, 모르는 값은 고르게 함', /"남" 1명[^\n]*자동/.test(box) && /"모름" 1명[^\n]*선택지에 없는 값/.test(box));
+  ok('나이 "23세", "스물셋"을 숫자로 바꿈', /"23세" → 23/.test(box) && /"스물셋" → 23/.test(box));
+  // 범주 합치기: '모름'을 빈 값으로
+  await p.selectOption('select[data-dq-recode="0"][data-from="모름"]', '');
+  await p.waitForTimeout(400);
+  const st = await p.evaluate(() => JSON.parse(localStorage.getItem('ladder.plan')));
+  ok('값 바꾸기가 기록에 남음', st.recode?.['0']?.['모름'] === '' && st.log.some(l => /모름/.test(l.q)));
+  // 연구 대상 조건: 나이 25 이상
+  await p.selectOption('select[data-dq-elig=di]', '1'); await p.waitForTimeout(300);
+  await p.fill('input[data-dq-elig=min]', '25'); await p.$eval('input[data-dq-elig=min]', e => e.dispatchEvent(new Event('change', { bubbles: true })));
+  await p.click('[data-dq-act=elig-add]'); await p.waitForTimeout(400);
+  const st2 = await p.$eval('#co-result .stats', e => e.innerText.replace(/\n/g, ' '));
+  ok('연구 대상 조건(나이 25 이상)으로 거름', /대상 아님 [1-9]/.test(st2), st2.match(/제외[^)]*\)/)?.[0]);
+  // 직접 빼기
+  const target = await p.evaluate(() => [...document.querySelectorAll('#dq-ids option')][3].value);
+  await p.fill('input[data-dq-man=id]', target); await p.fill('input[data-dq-man=why]', '자유 응답에 장난 글'); await p.click('[data-dq-act=manual-add]'); await p.waitForTimeout(400);
+  const st3 = await p.$eval('#co-result .stats', e => e.innerText.replace(/\n/g, ' '));
+  ok('응답 번호로 직접 빼고 이유를 남김', /직접 뺌 1/.test(st3) && (await p.evaluate(() => JSON.parse(localStorage.getItem('ladder.plan')).manual))[target] === '자유 응답에 장난 글');
+  const rep = await p.$eval('.dq-report p', e => e.innerText);
+  ok('연구 대상 절 문장에 제외 사유와 인원이 들어감', /연구 대상 조건에 맞지 않는 \d+명/.test(rep) && /부적절하다고 판단한 1명/.test(rep) && /주의 확인 문항 1개/.test(rep) && /최종 \d+명/.test(rep), rep.slice(0, 120));
+  ok('페이지 오류 없음 (클리닝)', !errs.length, errs.join(' | '));
 }
 
 // ===================== 2. 계산이 안 되는 자료 =====================
@@ -141,6 +184,9 @@ console.log('\n3. 사다리: 매개·조절 질문은 맞는 기법에서만');
       if (w.cur.type === 'out') continue;
       const node = w.cur.type === 'gate' ? R.gate : R.nodes[w.cur.id]; node.options.forEach((_, k) => q.push(path.concat(k))); }
     const bad = seen.filter(s => s.base && !C.gateFor(s.base)).map(s => `${s.base}→${s.id}`);
+    // 공분산분석: 세 집단 이상·기준 2가지 이상 경로에서는 매개·조절로 가지 않음
+    const g3 = []; { const q2 = [[]]; while (q2.length) { const path = q2.shift(); if (path.length > 14) continue; const w = C.walk(path); if (w.cur.type === 'result') { if (w.cur.base === 'r_ancova' && w.steps.some(st => /세 집단|기준 2가지 이상/.test(st.opt.label))) g3.push(w.cur.id); continue; } if (w.cur.type === 'out') continue; const node = w.cur.type === 'gate' ? R.gate : R.nodes[w.cur.id]; node.options.forEach((_, k) => q2.push(path.concat(k))); } }
+    bad.push(...g3.map(x => `세 집단 이상 공분산분석→${x}`));
     const gatedBases = [...new Set(seen.filter(s => s.base).map(s => s.base))];
     const noGate = [...new Set(seen.filter(s => !s.base && /^r_(onesample_t|paired_t|rm_anova|chisq|mcnemar|cochran|logistic|multilevel)$/.test(s.id)).map(s => s.id))];
     return { n: seen.length, bad, gatedBases, noGate };
@@ -164,6 +210,12 @@ console.log('\n4. 가설 붙여 넣기');
     '사회적 지지는 스트레스와 우울의 관계를 조절할 것이다.',
     '능력주의 신념이 외로움을 거쳐 외집단 혐오에 미치는 간접효과는 자존감에 따라 달라질 것이다.',
     '프로그램 참여 전보다 참여 후에 자기효능감이 높아질 것이다.',
+    '성별에 따라 능력주의 신념이 외집단 혐오에 미치는 영향이 다를 것이다.',
+    '사회적 지지가 높을수록 스트레스가 우울에 미치는 영향은 약해질 것이다.',
+    '사회비교경향성은 능력주의 신념이 외집단 혐오에 미치는 영향을 매개할 것이다.',
+    '능력주의 신념과 외집단 혐오의 관계에서 외로움의 매개효과는 자존감에 의해 조절될 것이다.',
+    '자존감은 능력주의 신념이 외로움을 매개로 외집단 혐오에 미치는 간접효과를 조절할 것이다.',
+    '학년에 따라 외로움이 진로불안에 미치는 영향은 달라질 것이다.',
   ];
   await p.click('.mb-paste summary'); await p.fill('#hp-text', lines.join('\n'));
   await p.click('[data-mb-act=paste-read]'); await p.waitForTimeout(700);
@@ -174,6 +226,14 @@ console.log('\n4. 가설 붙여 넣기');
   ok('"간접효과는 W에 따라 달라질 것이다"를 조절된 매개로 읽고 W를 남김', c7 && c7.model === 'modmed' && c7.w === '자존감' && c7.m[0] === '외로움', c7 ? `[${c7.model}] W=${c7.w}` : '카드 없음');
   ok('조절된 매개의 조절 경로가 문장에서 분명하지 않으면 학생에게 물음', c7 && !c7.wpath && (await p.$$eval('.mb-miss', e => e.map(x => x.innerText).join(' '))).includes('W가 바꾸는 경로'));
   ok('조절 가설은 그대로 읽음', c4 && c4.model === 'mod' && c4.w === '사회적 지지');
+  const cs = [[/성별에 따라 능력주의/, 'mod', '능력주의 신념', '성별', '외집단 혐오'], [/높을수록 스트레스/, 'mod', '스트레스', '사회적 지지', '우울'], [/학년에 따라 외로움/, 'mod', '외로움', '학년', '진로불안'], [/자존감에 의해/, 'modmed', '능력주의 신념', '자존감', '외집단 혐오'], [/자존감은 능력주의/, 'modmed', '능력주의 신념', '자존감', '외집단 혐오']];
+  cs.forEach(([re, model, X, W, Y]) => { const c = by(re); ok(`조절 문형: ${String(re).slice(1, -1)}`, c && c.model === model && c.x[0] === X && c.w === W && c.y === Y, c ? `[${c.model}] X=${c.x} W=${c.w} Y=${c.y}` : '카드 없음'); });
+  const cm = by(/영향을 매개할/); ok('매개 문형: "M은 X가 Y에 미치는 영향을 매개할 것이다"', cm && cm.model === 'med' && cm.m[0] === '사회비교경향성' && cm.x[0] === '능력주의 신념' && cm.y === '외집단 혐오', cm ? `X=${cm.x} M=${cm.m} Y=${cm.y}` : '');
+  ok('세 집단 이상인 조절변인(학년)은 매개·조절 계산 불가를 안내하고 완성으로 두지 않음', (await p.$$eval('.mb-warn', e => e.map(x => x.innerText).join(' '))).includes('세 집단 이상이면 PROCESS'));
+  // 안전장치: 이름에 문장 조각이 남은 카드는 완성으로 두지 않음
+  const ws = await p.evaluate(() => { const st = JSON.parse(localStorage.getItem('ladder.hyp')); st.cards.push({ ...st.cards[0], model: 'pred', x: ['능력주의 신념이 외로움'], m: [''], w: '', y: '미치는 간접효과', src: '(시험)', nameOk: false }); localStorage.setItem('ladder.hyp', JSON.stringify(st)); return st.cards.length; });
+  await p.reload(); await p.waitForTimeout(700); await p.click('#splash').catch(() => {});
+  ok('안전장치: 변인 이름에 문장 조각이 남으면 "확인해 주세요"로 표시하고 완성으로 두지 않음', (await p.$$eval('.mb-warn', e => e.map(x => x.innerText).join(' '))).includes('제대로 읽었는지'));
   const plan = await p.$$eval('.hp-plan .hp-row', e => e.map(x => x.innerText.replace(/\n/g, ' ')));
   const merged = plan.find(t => /정적 영향을 미칠/.test(t)) || '';
   ok('매개 카드에 합친 회귀 가설은 "매개분석 속 c 경로"로 표시', /속 c 경로/.test(merged), merged.slice(0, 80));
@@ -182,6 +242,49 @@ console.log('\n4. 가설 붙여 넣기');
   const st2 = await p.evaluate(() => JSON.parse(localStorage.getItem('ladder.hyp')));
   ok('[따로 분석하기]를 누르면 회귀 가설이 따로 카드가 됨', st2.cards.some(c => c.model === 'pred' && /정적 영향/.test(c.src || '')));
   ok('페이지 오류 없음 (가설)', !errs.length, errs.join(' | '));
+  await ctx.close();
+}
+
+// ===================== 5. 가설 전부 계산하기 =====================
+console.log('\n5. 가설 전부 계산하기');
+{
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } }); const p = await ctx.newPage(); const errs = []; p.on('pageerror', e => errs.push(e.message)); p.on('dialog', d => d.accept());
+  await p.goto(BASE); await p.evaluate(() => { localStorage.clear(); localStorage.setItem('ladder.noWelcome', 'true'); }); await p.reload(); await p.waitForTimeout(700);
+  await p.click('#splash').catch(() => {}); await p.click('[data-hp=mode-hyp]'); await p.waitForTimeout(300);
+  await p.fill('#hp-title', '능력주의 신념이 외집단 혐오에 미치는 영향: 사회비교경향성과 외로움의 순차적 매개효과'); await p.waitForTimeout(600);
+  await p.click('[data-mb-act=from-title]').catch(() => {}); await p.waitForTimeout(300);
+  // 경로 가설도 세움 (c, a, b 경로 → 상관·회귀·매개 결과가 섞임)
+  const pc = await p.$('[data-mb="c.0.paths"]'); if (pc) { await pc.check(); await p.waitForTimeout(300); }
+  await p.click('[data-hp=apply]').catch(() => {}); await p.waitForTimeout(700);
+  await p.evaluate(() => {
+    const sv = JSON.parse(localStorage.getItem('ladder.survey'));
+    const bank = { '능력주의 신념': ['노력하면 누구나 성공할 수 있다', '성공은 개인의 능력에 달려 있다', '보상은 노력에 비례해야 한다', '가난은 노력 부족 때문이다'], '사회비교경향성': ['나는 내가 한 일을 다른 사람이 한 일과 자주 비교한다', '나는 다른 사람과 나를 비교하지 않는다', '나는 남의 성취에 관심이 많다'], '외로움': ['나는 함께할 사람이 없다고 느낀다', '나는 혼자라고 느낀다', '나는 주변 사람과 가깝다고 느낀다'], '외집단 혐오': ['나와 다른 집단의 사람들은 불편하다', '나는 다른 집단 사람과 어울리기 싫다', '다른 집단 사람도 친구가 될 수 있다'] };
+    sv.scales.forEach(s => { const b = bank[s.name]; if (b) s.items = b.map((t, i) => ({ text: t, reverse: i === b.length - 1 })); });
+    if (!sv.demos.length) sv.demos = [{ text: '성별', type: 'choice', options: ['남성', '여성'] }, { text: '나이', type: 'number' }];
+    localStorage.setItem('ladder.survey', JSON.stringify(sv));
+  });
+  await p.reload(); await p.waitForTimeout(800); await p.click('#splash').catch(() => {});
+  await p.click('[data-nav=collect]'); await p.waitForTimeout(250);
+  await p.evaluate(() => document.querySelector('#co-sample').click()); await p.waitForTimeout(300);
+  await p.click('#co-run'); await p.waitForTimeout(600);
+  const nPlan = await p.evaluate(() => (JSON.parse(localStorage.getItem('ladder.hyp')).plan || []).length);
+  await p.click('[data-nav=analysis]'); await p.waitForTimeout(400);
+  ok('분석 화면에 [가설 전부 계산하기]가 있음', !!(await p.$('#an-main [data-an-act=run-all]')), `확정한 가설 ${nPlan}개`);
+  await p.click('#an-main [data-an-act=run-all]');
+  await p.waitForSelector('#an-runall', { timeout: 300000 });
+  const rows = await p.$$eval('#an-runall .hp-row', e => e.map(x => x.innerText.replace(/\n/g, ' ')));
+  const an = await p.evaluate(() => JSON.parse(localStorage.getItem('ladder.analyses')));
+  ok('가설마다 결과 줄이 생김', rows.length === nPlan, rows.map(r => r.slice(0, 40)).join(' | '));
+  ok('모든 가설이 계산됨', rows.every(r => /계산함/.test(r)), rows.filter(r => !/계산함/.test(r)).join(' | '));
+  ok('같은 분석은 한 번만 계산 (경로 가설이 매개분석 결과를 함께 씀)', an.length >= 1 && an.length < nPlan, `가설 ${nPlan}개 → 분석 ${an.length}개`);
+  ok('계산한 가설마다 [결과 보기]가 있음', (await p.$$('#an-runall [data-an-act=goto-res]')).length === nPlan);
+  await p.click('#an-main [data-an-act=run-all]'); await p.waitForTimeout(1500);
+  const an2 = await p.evaluate(() => JSON.parse(localStorage.getItem('ladder.analyses')));
+  ok('다시 눌러도 같은 자료면 다시 계산하지 않음', an2.length === an.length);
+  await p.click('[data-nav=interp]'); await p.waitForTimeout(500);
+  const intent = await p.evaluate(() => JSON.parse(localStorage.getItem('ladder.intent')));
+  ok('결과 해석에서 가설이 효과와 자동으로 이어짐', intent.hyps.every(h => h.effect), intent.hyps.map(h => `${!!h.effect}`).join(','));
+  ok('페이지 오류 없음 (전부 계산)', !errs.length, errs.join(' | '));
   await ctx.close();
 }
 
